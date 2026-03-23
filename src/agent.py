@@ -82,6 +82,7 @@ Return ONLY a raw JSON object — no markdown backticks, no explanation.
         headers={
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "web-search-2025-03-05",
             "content-type": "application/json",
         },
         json=payload,
