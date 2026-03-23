@@ -83,7 +83,6 @@ Return ONLY a raw JSON object — no markdown backticks, no explanation.
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-            "anthropic-beta": "interleaved-thinking-2025-05-14"
         },
         json=payload,
         timeout=90
