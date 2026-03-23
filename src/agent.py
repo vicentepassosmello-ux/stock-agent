@@ -71,11 +71,30 @@ def analyze_ticker(ticker: str) -> dict:
     pv       = portfolio_value()
     open_pos = list(portfolio["positions"].keys())
 
-    system_prompt = f"""You are an aggressive stock trading signal agent managing a real portfolio.
-Portfolio value: ${pv:.2f} | Cash: ${portfolio['cash']:.2f} | Open: {open_pos or 'none'}
-Max per position: {MAX_POSITION_PCT*100:.0f}% | Profile: AGGRESSIVE.
+    system_prompt = f"""You are a professional-grade portfolio strategist with full discretionary control over a real U.S. stock portfolio.
 
-Analyze using RSI, MACD, moving averages, trend, fundamentals, momentum.
+MANDATE: Generate maximum return on this portfolio.
+Portfolio value: ${pv:.2f} | Cash available: ${portfolio['cash']:.2f} | Open positions: {open_pos if open_pos else 'none'}
+Max allocation per position: {MAX_POSITION_PCT*100:.0f}% of portfolio value.
+
+You have full control over:
+- Position sizing: concentrate or diversify based on conviction
+- Risk management: stop-loss placement must be structure-based, not arbitrary
+- Strategy: short-term catalysts, momentum plays, or long-term thesis — your call
+- Priority: highest-conviction ideas get the most capital
+
+Your analysis must be deep and cover ALL of the following:
+TECHNICAL — RSI, MACD, moving averages, volume, support/resistance levels, trend structure
+FUNDAMENTAL — earnings growth, revenue trajectory, margins, valuation vs sector peers
+CATALYST — upcoming earnings dates, product launches, regulatory events, macro tailwinds/headwinds
+MOMENTUM — institutional flow signals, short interest, relative strength vs market
+
+Rules:
+- Only recommend BUY when you have strong conviction the position will be POSITIVE for the account
+- Size positions proportionally to conviction level
+- Every trade must have a clear, verifiable thesis in the reasoning field
+- SELL when the original thesis is broken or target is reached
+- HOLD only when waiting for a better entry or thesis is intact but not yet actionable
 
 Return ONLY raw JSON — no markdown:
 {{
@@ -94,6 +113,9 @@ Return ONLY raw JSON — no markdown:
   "stopLoss": number,
   "takeProfit": number,
   "riskReward": string,
+  "conviction": "high" | "medium" | "low",
+  "catalysts": string,
+  "thesis": string,
   "reasoning": string
 }}"""
 
@@ -359,7 +381,8 @@ def fmt_scan_report(new_signals: list, closed_trades: list) -> str:
             shares = alloc / s["currentPrice"] if alloc else 0
             pos    = portfolio["positions"].get(s["ticker"])
 
-            lines.append(f"{sig_e} *{s['ticker']}* {s['signal']} | Conf: {s['confidence']}% | Risco: {s['riskScore']}/10")
+            conv_e = {"high": "🔥", "medium": "⚡", "low": "💧"}.get(s.get("conviction","medium"), "⚡")
+            lines.append(f"{sig_e} *{s['ticker']}* {s['signal']} {conv_e} | Conf: {s['confidence']}% | Risco: {s['riskScore']}/10")
             lines.append(f"   Preço ref: ${s['currentPrice']:.2f} | R/R: {s.get('riskReward','—')}")
             if s["signal"] == "BUY":
                 lines.append(f"   Sugestão: {shares:.4f} shares (${alloc:.2f} = {alloc/pv*100:.0f}% portfólio)")
@@ -368,7 +391,13 @@ def fmt_scan_report(new_signals: list, closed_trades: list) -> str:
             elif s["signal"] == "SELL" and pos:
                 lines.append(f"   Posição: {pos['shares']:.4f} shares | Entrada ${pos['entry_price']:.2f}")
                 lines.append(f"   ➡️ Confirmar: `SELL {pos['shares']:.4f} {s['ticker']} @ PRECO_EXECUTADO`")
-            lines.append(f"   _{s.get('reasoning','')[:120]}_\n")
+            if s.get("catalysts"):
+                lines.append(f"   📰 {s['catalysts'][:120]}")
+            if s.get("thesis"):
+                lines.append(f"   🎯 _{s['thesis'][:150]}_")
+            elif s.get("reasoning"):
+                lines.append(f"   🎯 _{s['reasoning'][:150]}_")
+            lines.append("")
 
     lines.append(f"💵 Caixa: ${portfolio['cash']:.2f} ({portfolio['cash']/pv*100:.0f}%)")
     lines.append("_Para ver portfólio: `STATUS`_")
