@@ -70,7 +70,7 @@ Return ONLY a raw JSON object — no markdown backticks, no explanation.
 }}"""
 
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-3-5-haiku-20241022",
         "max_tokens": 1200,
         "system": system_prompt,
         "messages": [{"role": "user", "content": f"Analyze stock ticker: {ticker}. Today's date: {datetime.now(MARKET_TZ).strftime('%Y-%m-%d')}. Use your knowledge of this company, recent trends, technical analysis principles, and fundamental data to generate the signal."}]
@@ -86,6 +86,8 @@ Return ONLY a raw JSON object — no markdown backticks, no explanation.
         json=payload,
         timeout=90
     )
+    if not resp.ok:
+        log.error(f"API error {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     data = resp.json()
 
