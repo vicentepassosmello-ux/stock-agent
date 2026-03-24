@@ -12,6 +12,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
@@ -75,18 +76,19 @@ def calc_position_size(signal: dict) -> float:
 def fetch_market_data(ticker: str) -> dict:
     """Fetch real-time price + technicals directly from Alpaca."""
 
-    # Latest quote (real-time bid/ask midpoint)
-    quote_req = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+    # Latest quote via IEX (free plan)
+    quote_req = StockLatestQuoteRequest(symbol_or_symbols=ticker, feed=DataFeed.IEX)
     quote     = data_client.get_stock_latest_quote(quote_req)[ticker]
     price     = round(float((quote.bid_price + quote.ask_price) / 2), 2)
 
-    # Daily bars — last 60 days for technicals
+    # Daily bars via IEX — last 90 days for technicals
     end   = datetime.now(ZoneInfo("UTC"))
     start = end - timedelta(days=90)
     bars_req = StockBarsRequest(
         symbol_or_symbols=ticker,
         timeframe=TimeFrame.Day,
-        start=start, end=end
+        start=start, end=end,
+        feed=DataFeed.IEX
     )
     bars  = data_client.get_stock_bars(bars_req)[ticker]
     close = pd.Series([b.close for b in bars])
@@ -295,12 +297,26 @@ def check_stops(prices: dict) -> list:
 
 # ── Telegram ─────────────────────────────────────────────────────────
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, buttons: list = None) -> None:
+    """Send message with optional inline keyboard buttons.
+    buttons = [ [{"text": "label", "callback_data": "data"}, ...], ... ]
+    """
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
+            json=payload, timeout=15)
     except Exception as e:
-        log.error(f"Telegram: {e}")
+        log.error(f"Telegram send: {e}")
+
+def answer_callback(callback_id: str, text: str = "") -> None:
+    """Acknowledge a button press (removes loading spinner)."""
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text}, timeout=10)
+    except Exception as e:
+        log.error(f"Telegram callback: {e}")
 
 def fmt_status() -> str:
     pv  = portfolio_value()
@@ -396,6 +412,17 @@ def fmt_scan_report(signals: list, closed_trades: list) -> str:
 
     lines.append(f"💵 Caixa: ${portfolio['cash']:.2f} | `STATUS` para portfólio completo")
     return "\n".join(lines)
+
+def build_signal_buttons(signals: list) -> list:
+    rows = []
+    for s in signals:
+        ticker = s["ticker"]
+        action = s["signal"]
+        rows.append([
+            {"text": f"✅ {action} {ticker}", "callback_data": f"CONFIRM_{ticker}"},
+            {"text": f"❌ Ignorar {ticker}",  "callback_data": f"CANCEL_{ticker}"},
+        ])
+    return rows
 
 
 # ── Pending expiry watchdog ───────────────────────────────────────────
@@ -504,6 +531,20 @@ def telegram_listener():
                 params={"offset": _last_update_id + 1, "timeout": 30}, timeout=40)
             for update in resp.json().get("result", []):
                 _last_update_id = update["update_id"]
+
+                # Handle inline button press
+                cb = update.get("callback_query")
+                if cb:
+                    chat_id = str(cb.get("from", {}).get("id", ""))
+                    data    = cb.get("data", "")
+                    cb_id   = cb.get("id", "")
+                    if chat_id == TELEGRAM_CHAT_ID and data:
+                        log.info(f"Button pressed: {data!r}")
+                        answer_callback(cb_id)
+                        handle_command(data.replace("CONFIRM_", "CONFIRM ").replace("CANCEL_", "CANCEL "))
+                    continue
+
+                # Handle text message
                 msg     = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text    = msg.get("text", "").strip()
@@ -565,7 +606,9 @@ def scan_all() -> None:
         log.info("No actionable signals")
         return
 
-    send_telegram(fmt_scan_report(actionable, closed_trades))
+    report  = fmt_scan_report(actionable, closed_trades)
+    buttons = build_signal_buttons(actionable) if actionable else None
+    send_telegram(report, buttons)
     log.info(f"Report sent. Portfolio: ${pv:.2f}")
 
 
