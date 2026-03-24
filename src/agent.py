@@ -491,10 +491,10 @@ def scan_all() -> None:
             sig = analyze_ticker(ticker)
             signals[ticker] = sig
             log.info(f"{ticker}: {sig['signal']} conf={sig['confidence']}% risk={sig['riskScore']}")
-            time.sleep(2)
+            time.sleep(30)
         except Exception as e:
             log.error(f"Error {ticker}: {e}")
-            time.sleep(5)
+            time.sleep(30)
 
     if not signals:
         return
