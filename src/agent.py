@@ -1,6 +1,7 @@
 import os, json, time, logging, threading, requests
-import yfinance as yf
-from datetime import datetime, time as dt_time
+import pandas as pd
+import numpy as np
+from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -8,6 +9,9 @@ from alpaca.trading.requests import (
     TakeProfitRequest, StopLossRequest
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
@@ -30,8 +34,9 @@ MARKET_TZ    = ZoneInfo("America/New_York")
 MARKET_OPEN  = dt_time(9, 30)
 MARKET_CLOSE = dt_time(16, 0)
 
-# ── Alpaca client (paper trading) ─────────────────────────────────────
-alpaca = TradingClient(ALPACA_API_KEY, ALPACA_SECRET, paper=True)
+# ── Alpaca clients ────────────────────────────────────────────────────
+alpaca      = TradingClient(ALPACA_API_KEY, ALPACA_SECRET, paper=True)
+data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
 
 # ── Portfolio state ───────────────────────────────────────────────────
 portfolio = {
@@ -65,28 +70,45 @@ def calc_position_size(signal: dict) -> float:
     return round(min(max_alloc * conf_mult * risk_mult, portfolio["cash"]), 2)
 
 
-# ── Market data via yfinance ──────────────────────────────────────────
+# ── Market data via Alpaca Data API ──────────────────────────────────
 
 def fetch_market_data(ticker: str) -> dict:
-    tk   = yf.Ticker(ticker)
-    info = tk.fast_info
-    hist = tk.history(period="3mo", interval="1d")
-    price   = round(float(info.last_price), 2)
-    prev    = round(float(info.previous_close), 2)
-    chg_pct = round((price - prev) / prev * 100, 2)
-    ma20 = round(hist["Close"].tail(20).mean(), 2) if len(hist) >= 20 else price
-    ma50 = round(hist["Close"].tail(50).mean(), 2) if len(hist) >= 50 else price
-    delta = hist["Close"].diff()
+    """Fetch real-time price + technicals directly from Alpaca."""
+
+    # Latest quote (real-time bid/ask midpoint)
+    quote_req = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+    quote     = data_client.get_stock_latest_quote(quote_req)[ticker]
+    price     = round(float((quote.bid_price + quote.ask_price) / 2), 2)
+
+    # Daily bars — last 60 days for technicals
+    end   = datetime.now(ZoneInfo("UTC"))
+    start = end - timedelta(days=90)
+    bars_req = StockBarsRequest(
+        symbol_or_symbols=ticker,
+        timeframe=TimeFrame.Day,
+        start=start, end=end
+    )
+    bars  = data_client.get_stock_bars(bars_req)[ticker]
+    close = pd.Series([b.close for b in bars])
+
+    prev    = round(float(close.iloc[-2]) if len(close) >= 2 else price, 2)
+    chg_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+    ma20    = round(float(close.tail(20).mean()), 2) if len(close) >= 20 else price
+    ma50    = round(float(close.tail(50).mean()), 2) if len(close) >= 50 else price
+    high52  = round(float(close.tail(252).max()), 2) if len(close) >= 10 else price
+    low52   = round(float(close.tail(252).min()), 2) if len(close) >= 10 else price
+
+    # RSI(14)
+    delta = close.diff()
     gain  = delta.clip(lower=0).tail(14).mean()
     loss  = (-delta.clip(upper=0)).tail(14).mean()
-    rsi   = round(100 - (100 / (1 + gain / loss)), 1) if loss != 0 else 50.0
-    high52 = round(float(info.year_high), 2)
-    low52  = round(float(info.year_low), 2)
+    rsi   = round(float(100 - (100 / (1 + gain / loss))), 1) if loss and loss != 0 else 50.0
+
     return {
         "price": price, "prev_close": prev, "chg_pct": chg_pct,
         "ma20": ma20, "ma50": ma50, "rsi": rsi,
         "high52": high52, "low52": low52,
-        "support": round(low52 * 1.05, 2),
+        "support":    round(low52 * 1.05, 2),
         "resistance": round(high52 * 0.95, 2),
     }
 
