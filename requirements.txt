@@ -1,3 +1,4 @@
 requests==2.32.3
-yfinance==0.2.51
 alpaca-py==0.38.0
+pandas==2.2.3
+numpy==2.2.4
