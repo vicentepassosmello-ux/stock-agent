@@ -121,7 +121,7 @@ Return ONLY raw JSON — no markdown:
 
     payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1500,
+        "max_tokens": 800,
         "system": system_prompt,
         "tools": [{"type": "web_search_20250305", "name": "web_search"}],
         "messages": [{"role": "user", "content": f"Search for the CURRENT live stock price of {ticker} right now on March 24 2026, then analyze it as a portfolio strategist. You MUST use web search to get the real price before generating any signal."}]
@@ -491,10 +491,10 @@ def scan_all() -> None:
             sig = analyze_ticker(ticker)
             signals[ticker] = sig
             log.info(f"{ticker}: {sig['signal']} conf={sig['confidence']}% risk={sig['riskScore']}")
-            time.sleep(30)
+            time.sleep(65)
         except Exception as e:
             log.error(f"Error {ticker}: {e}")
-            time.sleep(30)
+            time.sleep(65)
 
     if not signals:
         return
