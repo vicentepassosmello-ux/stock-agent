@@ -4,11 +4,8 @@ import numpy as np
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest,
-    TakeProfitRequest, StopLossRequest
-)
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -191,7 +188,8 @@ Return ONLY raw JSON:
 # ── Alpaca order execution ────────────────────────────────────────────
 
 def execute_buy(ticker: str, signal: dict) -> dict:
-    """Place bracket limit order on Alpaca (paper). Returns fill info."""
+    """Place simple limit order on Alpaca (paper).
+    Bracket orders don't support fractional shares — stops monitored internally."""
     alloc       = calc_position_size(signal)
     limit_price = round(signal.get("limitPrice", signal["currentPrice"] * 1.001), 2)
     qty         = round(alloc / limit_price, 6)
@@ -202,12 +200,9 @@ def execute_buy(ticker: str, signal: dict) -> dict:
         side          = OrderSide.BUY,
         time_in_force = TimeInForce.DAY,
         limit_price   = limit_price,
-        order_class   = OrderClass.BRACKET,
-        take_profit   = TakeProfitRequest(limit_price=round(signal["takeProfit"], 2)),
-        stop_loss     = StopLossRequest(stop_price=round(signal["stopLoss"], 2)),
     )
     order = alpaca.submit_order(order_req)
-    log.info(f"Alpaca BUY submitted: {ticker} {qty:.4f} @ ${limit_price} | order_id={order.id}")
+    log.info(f"Alpaca BUY submitted: {ticker} {qty:.6f} @ ${limit_price} | order_id={order.id}")
     return {"order_id": str(order.id), "qty": qty, "limit_price": limit_price, "alloc": alloc}
 
 
