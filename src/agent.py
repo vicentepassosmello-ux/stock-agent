@@ -121,14 +121,20 @@ Return ONLY raw JSON — no markdown:
 
     payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1000,
+        "max_tokens": 1500,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": f"Analyze: {ticker}. Date: {datetime.now(MARKET_TZ).strftime('%Y-%m-%d %H:%M')} ET"}]
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [{"role": "user", "content": f"Search for the CURRENT live stock price of {ticker} right now on March 24 2026, then analyze it as a portfolio strategist. You MUST use web search to get the real price before generating any signal."}]
     }
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json=payload, timeout=90
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "anthropic-beta": "web-search-2025-03-05",
+        },
+        json=payload, timeout=120
     )
     if not resp.ok:
         log.error(f"API {resp.status_code}: {resp.text}")
