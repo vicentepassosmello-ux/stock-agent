@@ -230,6 +230,48 @@ def get_alpaca_account() -> dict:
         "cash": float(acc.cash),
     }
 
+def sync_with_alpaca() -> str:
+    """Sync portfolio state from Alpaca on startup — picks up existing positions."""
+    try:
+        acc       = alpaca.get_account()
+        positions = alpaca.get_all_positions()
+
+        portfolio["cash"] = float(acc.cash)
+
+        synced = []
+        for pos in positions:
+            ticker = pos.symbol
+            price  = float(pos.current_price or pos.avg_entry_price)
+            entry  = float(pos.avg_entry_price)
+            shares = float(pos.qty)
+            cost   = entry * shares
+
+            if ticker not in portfolio["positions"]:
+                portfolio["positions"][ticker] = {
+                    "shares":        round(shares, 6),
+                    "entry_price":   round(entry, 2),
+                    "current_price": round(price, 2),
+                    "stop_loss":     round(entry * 0.92, 2),   # default 8% stop
+                    "take_profit":   round(entry * 1.20, 2),   # default 20% target
+                    "opened_at":     "sync",
+                    "allocated":     round(cost, 2),
+                }
+                synced.append(ticker)
+                log.info(f"Synced from Alpaca: {ticker} {shares:.4f} @ ${entry:.2f}")
+
+        if portfolio["peak_value"] < portfolio_value():
+            portfolio["peak_value"] = portfolio_value()
+
+        if synced:
+            return (f"🔄 *Portfólio sincronizado com Alpaca*\n"
+                    f"Posições importadas: {', '.join(synced)}\n"
+                    f"⚠️ Stop/target com valores padrão (8%/20%). "
+                    f"Use `SETSTOP COIN 170 200` para ajustar.")
+        return ""
+    except Exception as e:
+        log.error(f"Sync error: {e}")
+        return f"⚠️ Erro ao sincronizar com Alpaca: {e}"
+
 
 # ── Portfolio tracking ────────────────────────────────────────────────
 
@@ -260,33 +302,69 @@ def record_sell(ticker: str, order_info: dict) -> dict | None:
     portfolio["history"].append(trade)
     return trade
 
+def execute_auto_sell(ticker: str, price: float, reason: str) -> dict | None:
+    """Execute sell order on Alpaca automatically — no confirmation needed."""
+    pos = portfolio["positions"].get(ticker)
+    if not pos:
+        return None
+    try:
+        order_req = LimitOrderRequest(
+            symbol        = ticker,
+            qty           = pos["shares"],
+            side          = OrderSide.SELL,
+            time_in_force = TimeInForce.DAY,
+            limit_price   = round(price * 0.999, 2),
+        )
+        order = alpaca.submit_order(order_req)
+        log.info(f"AUTO SELL {ticker} @ ${price:.2f} order_id={order.id}")
+    except Exception as e:
+        log.error(f"Auto sell error {ticker}: {e}")
+
+    pos_copy = portfolio["positions"].pop(ticker)
+    proceeds = pos_copy["shares"] * price
+    pnl      = proceeds - pos_copy["allocated"]
+    portfolio["cash"] += proceeds
+    trade = {
+        "ticker": ticker, "entry": pos_copy["entry_price"], "exit": price,
+        "shares": pos_copy["shares"], "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl / pos_copy["allocated"] * 100, 2),
+        "reason": reason, "closed_at": ts(),
+    }
+    portfolio["history"].append(trade)
+    return trade
+
+
 def check_stops(prices: dict) -> list:
     closed = []
     for ticker, pos in list(portfolio["positions"].items()):
         price = prices.get(ticker, pos["current_price"])
         pos["current_price"] = price
+
         if price <= pos["stop_loss"]:
-            pos_copy = portfolio["positions"].pop(ticker)
-            pnl = (price - pos_copy["entry_price"]) * pos_copy["shares"]
-            portfolio["cash"] += price * pos_copy["shares"]
-            trade = {"ticker": ticker, "entry": pos_copy["entry_price"], "exit": price,
-                     "shares": pos_copy["shares"], "pnl": round(pnl, 2),
-                     "pnl_pct": round(pnl / pos_copy["allocated"] * 100, 2),
-                     "reason": "🛑 stop loss", "closed_at": ts()}
-            portfolio["history"].append(trade)
-            closed.append(trade)
-            log.info(f"STOP HIT {ticker} @ ${price:.2f} PnL ${pnl:+.2f}")
+            log.info(f"STOP HIT {ticker} @ ${price:.2f}")
+            trade = execute_auto_sell(ticker, price, "🛑 stop loss automático")
+            if trade:
+                closed.append(trade)
+                pnl = trade["pnl"]
+                send_telegram(
+                    f"🛑 *Stop loss executado — {ticker}*\n"
+                    f"  Vendido automaticamente @ ${price:.2f}\n"
+                    f"  PnL: *{pnl:+.2f}* ({trade['pnl_pct']:+.1f}%)\n"
+                    f"  💵 Caixa: ${portfolio['cash']:.2f}"
+                )
+
         elif price >= pos["take_profit"]:
-            pos_copy = portfolio["positions"].pop(ticker)
-            pnl = (price - pos_copy["entry_price"]) * pos_copy["shares"]
-            portfolio["cash"] += price * pos_copy["shares"]
-            trade = {"ticker": ticker, "entry": pos_copy["entry_price"], "exit": price,
-                     "shares": pos_copy["shares"], "pnl": round(pnl, 2),
-                     "pnl_pct": round(pnl / pos_copy["allocated"] * 100, 2),
-                     "reason": "✅ take profit", "closed_at": ts()}
-            portfolio["history"].append(trade)
-            closed.append(trade)
-            log.info(f"TARGET HIT {ticker} @ ${price:.2f} PnL ${pnl:+.2f}")
+            log.info(f"TARGET HIT {ticker} @ ${price:.2f}")
+            trade = execute_auto_sell(ticker, price, "✅ take profit automático")
+            if trade:
+                closed.append(trade)
+                pnl = trade["pnl"]
+                send_telegram(
+                    f"✅ *Take profit executado — {ticker}*\n"
+                    f"  Vendido automaticamente @ ${price:.2f}\n"
+                    f"  PnL: *{pnl:+.2f}* ({trade['pnl_pct']:+.1f}%)\n"
+                    f"  💵 Caixa: ${portfolio['cash']:.2f}"
+                )
     return closed
 
 
@@ -444,6 +522,14 @@ def parse_command(text: str) -> dict | None:
         return {"cmd": "confirm", "ticker": text.split()[1]}
     if text.startswith("CANCEL ") and len(text.split()) == 2:
         return {"cmd": "cancel", "ticker": text.split()[1]}
+    # SETSTOP COIN 170 200  (stop=170, target=200)
+    parts = text.split()
+    if parts[0] == "SETSTOP" and len(parts) == 4:
+        try:
+            return {"cmd": "setstop", "ticker": parts[1],
+                    "stop": float(parts[2]), "target": float(parts[3])}
+        except ValueError:
+            pass
     return None
 
 def handle_command(text: str):
@@ -461,6 +547,20 @@ def handle_command(text: str):
 
     if cmd == "status":
         send_telegram(fmt_status())
+
+    elif cmd == "setstop":
+        tkr  = parsed["ticker"]
+        pos  = portfolio["positions"].get(tkr)
+        if not pos:
+            send_telegram(f"❌ Nenhuma posição aberta em *{tkr}*.")
+        else:
+            pos["stop_loss"]   = parsed["stop"]
+            pos["take_profit"] = parsed["target"]
+            send_telegram(
+                f"✅ *{tkr}* atualizado\n"
+                f"  🛑 Stop: ${parsed['stop']:.2f}\n"
+                f"  ✅ Target: ${parsed['target']:.2f}"
+            )
 
     elif cmd == "cancel":
         tkr = parsed["ticker"]
@@ -633,6 +733,11 @@ def main() -> None:
         "❌ Ignorar: `CANCEL NVDA`\n"
         "📊 Portfólio: `STATUS`"
     )
+
+    # Sync existing Alpaca positions on every startup
+    sync_msg = sync_with_alpaca()
+    if sync_msg:
+        send_telegram(sync_msg)
 
     while True:
         if is_market_hours():
