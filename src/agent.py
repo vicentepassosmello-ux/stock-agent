@@ -122,11 +122,31 @@ def analyze_ticker(ticker: str, mkt: dict) -> dict:
     macd_sig = "bullish" if mkt["ma20"] > mkt["ma50"] else \
                "bearish" if mkt["ma20"] < mkt["ma50"] else "neutral"
 
+    # Build open positions context with original strategy
+    positions_context = ""
+    if portfolio["positions"]:
+        positions_context = "\nOPEN POSITIONS & ORIGINAL STRATEGY:\n"
+        for t, p in portfolio["positions"].items():
+            pnl_pct = (p["current_price"] - p["entry_price"]) / p["entry_price"] * 100
+            positions_context += (
+                f"- {t}: {p['shares']:.4f} shares @ ${p['entry_price']:.2f} entry "
+                f"(now ${p['current_price']:.2f}, {pnl_pct:+.1f}%)\n"
+                f"  Stop: ${p['stop_loss']:.2f} | Target: ${p['take_profit']:.2f} | R/R: {p.get('risk_reward','-')}\n"
+                f"  Entry date: {p.get('strategy_date', p.get('opened_at', '-'))}\n"
+                f"  Original thesis: {p.get('thesis', 'N/A')}\n"
+                f"  Catalysts: {p.get('catalysts', 'N/A')}\n"
+                f"  Conviction at entry: {p.get('conviction','-')} ({p.get('original_conf','-')}% confidence)\n"
+            )
+
     system_prompt = f"""You are a professional-grade portfolio strategist with full discretionary control.
 
 MANDATE: Generate maximum return on this portfolio.
 Portfolio value: ${pv:.2f} | Cash: ${portfolio['cash']:.2f} | Open positions: {open_pos or 'none'}
 Max per position: {MAX_POSITION_PCT*100:.0f}% | Profile: AGGRESSIVE.
+{positions_context}
+When analyzing a ticker that is already in the portfolio, evaluate whether the ORIGINAL THESIS
+is still valid. Only recommend SELL if the thesis is broken, target is reached, or risk has
+materially changed. Do NOT recommend SELL just because of short-term volatility if the thesis holds.
 
 VERIFIED REAL-TIME DATA for {ticker}:
 - Price: ${mkt['price']} ({mkt['chg_pct']:+.2f}% today)
@@ -207,9 +227,15 @@ def execute_buy(ticker: str, signal: dict) -> dict:
 
 
 def execute_sell(ticker: str, signal: dict, pos: dict) -> dict:
-    """Place limit sell order on Alpaca for full position."""
+    """Place limit sell order on Alpaca — verifies position exists first."""
+    # Verify position exists in Alpaca before selling
+    try:
+        alpaca_pos = alpaca.get_open_position(ticker)
+        qty = float(alpaca_pos.qty)
+    except Exception:
+        raise ValueError(f"No open position for {ticker} in Alpaca — cannot sell.")
+
     limit_price = round(signal.get("currentPrice", pos["entry_price"]) * 0.999, 2)
-    qty         = pos["shares"]
     order_req = LimitOrderRequest(
         symbol        = ticker,
         qty           = qty,
@@ -231,12 +257,21 @@ def get_alpaca_account() -> dict:
     }
 
 def sync_with_alpaca() -> str:
-    """Sync portfolio state from Alpaca on startup — picks up existing positions."""
+    """Sync portfolio state from Alpaca on startup — only real positions."""
     try:
         acc       = alpaca.get_account()
         positions = alpaca.get_all_positions()
 
         portfolio["cash"] = float(acc.cash)
+
+        # Real tickers in Alpaca
+        real_tickers = {pos.symbol for pos in positions}
+
+        # Remove phantom positions (in agent memory but not in Alpaca)
+        phantoms = [t for t in list(portfolio["positions"].keys()) if t not in real_tickers]
+        for t in phantoms:
+            log.warning(f"Removing phantom position: {t}")
+            portfolio["positions"].pop(t, None)
 
         synced = []
         for pos in positions:
@@ -251,13 +286,17 @@ def sync_with_alpaca() -> str:
                     "shares":        round(shares, 6),
                     "entry_price":   round(entry, 2),
                     "current_price": round(price, 2),
-                    "stop_loss":     round(entry * 0.92, 2),   # default 8% stop
-                    "take_profit":   round(entry * 1.20, 2),   # default 20% target
+                    "stop_loss":     round(entry * 0.92, 2),
+                    "take_profit":   round(entry * 1.20, 2),
                     "opened_at":     "sync",
                     "allocated":     round(cost, 2),
                 }
                 synced.append(ticker)
                 log.info(f"Synced from Alpaca: {ticker} {shares:.4f} @ ${entry:.2f}")
+            else:
+                # Update qty and price from Alpaca (source of truth)
+                portfolio["positions"][ticker]["shares"]        = round(shares, 6)
+                portfolio["positions"][ticker]["current_price"] = round(price, 2)
 
         if portfolio["peak_value"] < portfolio_value():
             portfolio["peak_value"] = portfolio_value()
@@ -287,6 +326,13 @@ def record_buy(ticker: str, signal: dict, order_info: dict) -> None:
         "opened_at":     ts(),
         "allocated":     alloc,
         "order_id":      order_info["order_id"],
+        # Strategy context — preserved for all future decisions
+        "thesis":        signal.get("thesis", ""),
+        "catalysts":     signal.get("catalysts", ""),
+        "conviction":    signal.get("conviction", "medium"),
+        "original_conf": signal.get("confidence", 0),
+        "risk_reward":   signal.get("riskReward", ""),
+        "strategy_date": ts(),
     }
 
 def record_sell(ticker: str, order_info: dict) -> dict | None:
@@ -308,9 +354,12 @@ def execute_auto_sell(ticker: str, price: float, reason: str) -> dict | None:
     if not pos:
         return None
     try:
+        # Verify position exists in Alpaca
+        alpaca_pos = alpaca.get_open_position(ticker)
+        qty = float(alpaca_pos.qty)
         order_req = LimitOrderRequest(
             symbol        = ticker,
-            qty           = pos["shares"],
+            qty           = qty,
             side          = OrderSide.SELL,
             time_in_force = TimeInForce.DAY,
             limit_price   = round(price * 0.999, 2),
@@ -420,9 +469,15 @@ def fmt_status() -> str:
             cp    = pos["current_price"]
             pnl   = (cp - pos["entry_price"]) * pos["shares"]
             pnl_p = (cp - pos["entry_price"]) / pos["entry_price"] * 100
-            lines.append(f"{'📈' if pnl >= 0 else '📉'} *{tkr}* {pos['shares']:.4f} shares\n"
-                         f"   ${pos['entry_price']:.2f}→${cp:.2f} | PnL {pnl:+.2f} ({pnl_p:+.1f}%)\n"
-                         f"   🛑${pos['stop_loss']:.2f}  ✅${pos['take_profit']:.2f}")
+            conv_e = {"high": "🔥", "medium": "⚡", "low": "💧"}.get(pos.get("conviction","medium"), "⚡")
+            thesis_line = f"\n   🎯 _{pos['thesis'][:120]}_" if pos.get("thesis") else ""
+            lines.append(
+                f"{'📈' if pnl >= 0 else '📉'} *{tkr}* {conv_e} | {pos['shares']:.4f} shares\n"
+                f"   Entrada: ${pos['entry_price']:.2f} em {pos.get('strategy_date', pos.get('opened_at','-'))}\n"
+                f"   Atual: ${cp:.2f} | PnL {pnl:+.2f} ({pnl_p:+.1f}%)\n"
+                f"   🛑${pos['stop_loss']:.2f}  ✅${pos['take_profit']:.2f}  R/R: {pos.get('risk_reward','-')}"
+                f"{thesis_line}"
+            )
 
     if portfolio["pending"]:
         lines.append("\n⏳ *Aguardando confirmação (2 min)*")
@@ -522,7 +577,7 @@ def parse_command(text: str) -> dict | None:
         return {"cmd": "confirm", "ticker": text.split()[1]}
     if text.startswith("CANCEL ") and len(text.split()) == 2:
         return {"cmd": "cancel", "ticker": text.split()[1]}
-    # SETSTOP COIN 170 200  (stop=170, target=200)
+    # SETSTOP COIN 170 200
     parts = text.split()
     if parts[0] == "SETSTOP" and len(parts) == 4:
         try:
@@ -530,6 +585,9 @@ def parse_command(text: str) -> dict | None:
                     "stop": float(parts[2]), "target": float(parts[3])}
         except ValueError:
             pass
+    # SETTHESIS COIN RSI oversold bounce with crypto institutional demand
+    if parts[0] == "SETTHESIS" and len(parts) >= 3:
+        return {"cmd": "setthesis", "ticker": parts[1], "thesis": " ".join(parts[2:])}
     return None
 
 def handle_command(text: str):
@@ -560,6 +618,19 @@ def handle_command(text: str):
                 f"✅ *{tkr}* atualizado\n"
                 f"  🛑 Stop: ${parsed['stop']:.2f}\n"
                 f"  ✅ Target: ${parsed['target']:.2f}"
+            )
+
+    elif cmd == "setthesis":
+        tkr  = parsed["ticker"]
+        pos  = portfolio["positions"].get(tkr)
+        if not pos:
+            send_telegram(f"❌ Nenhuma posição aberta em *{tkr}*.")
+        else:
+            pos["thesis"]       = parsed["thesis"]
+            pos["strategy_date"] = pos.get("strategy_date", ts())
+            send_telegram(
+                f"✅ *{tkr}* — tese registrada:\n"
+                f"  🎯 _{parsed['thesis']}_"
             )
 
     elif cmd == "cancel":
@@ -655,6 +726,46 @@ def telegram_listener():
 
 def scan_all() -> None:
     log.info(f"Scanning: {TICKERS}")
+
+    # ── Step 1: Sync real positions from Alpaca (always first) ──
+    try:
+        acc       = alpaca.get_account()
+        positions = alpaca.get_all_positions()
+        portfolio["cash"] = float(acc.cash)
+        real_tickers = {pos.symbol for pos in positions}
+
+        # Remove phantom positions
+        for t in list(portfolio["positions"].keys()):
+            if t not in real_tickers:
+                log.warning(f"Removing phantom position: {t}")
+                portfolio["positions"].pop(t, None)
+
+        # Update real positions (qty + price from Alpaca)
+        for pos in positions:
+            ticker = pos.symbol
+            price  = float(pos.current_price or pos.avg_entry_price)
+            shares = float(pos.qty)
+            entry  = float(pos.avg_entry_price)
+            if ticker in portfolio["positions"]:
+                portfolio["positions"][ticker]["shares"]        = round(shares, 6)
+                portfolio["positions"][ticker]["current_price"] = round(price, 2)
+            else:
+                portfolio["positions"][ticker] = {
+                    "shares": round(shares, 6), "entry_price": round(entry, 2),
+                    "current_price": round(price, 2),
+                    "stop_loss":  round(entry * 0.92, 2),
+                    "take_profit": round(entry * 1.20, 2),
+                    "opened_at": "sync", "allocated": round(entry * shares, 2),
+                }
+                log.info(f"New position from Alpaca: {ticker} {shares:.4f} @ ${entry:.2f}")
+
+        pv = portfolio_value()
+        if pv > portfolio["peak_value"]:
+            portfolio["peak_value"] = pv
+        log.info(f"Alpaca sync OK — cash=${portfolio['cash']:.2f} positions={list(portfolio['positions'].keys())}")
+    except Exception as e:
+        log.error(f"Alpaca sync failed: {e}")
+
     signals  = {}
     prices   = {}
 
